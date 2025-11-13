@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler, Subset
 from torchvision import transforms, datasets, models
 from torchvision.datasets import CIFAR10
 from PIL import Image
@@ -47,14 +47,64 @@ class TestFolder(torch.utils.data.Dataset):
         self.root = Path(root)
         self.files = sorted([p for p in self.root.glob("*") if p.suffix.lower() in [".jpg",".jpeg",".png"]])
         self.transform = transform
+        if not self.files:
+            raise FileNotFoundError(f"No images found under {self.root}")
+
     def __len__(self):
         return len(self.files)
+
     def __getitem__(self, idx):
         fp = self.files[idx]
         img = Image.open(fp).convert("RGB")
-        if self.transform: img = self.transform(img)
+        if self.transform:
+            img = self.transform(img)
         # id: filename stem or numeric part; PDF允许按样例submission来（此处用stem）
         return img, fp.stem
+
+
+class KaggleDogsDataset(torch.utils.data.Dataset):
+    """Dataset helper for Kaggle Dogs vs Cats style folders without sub-directories."""
+
+    IMG_EXTS = {".jpg", ".jpeg", ".png"}
+
+    def __init__(self, files, labels, transform=None):
+        self.files = files
+        self.labels = labels
+        self.transform = transform
+
+    @classmethod
+    def from_directory(cls, root, transform=None):
+        root = Path(root)
+        files = sorted([p for p in root.glob("*") if p.suffix.lower() in cls.IMG_EXTS])
+        if not files:
+            raise FileNotFoundError(f"No images found under {root}")
+        labels = []
+        label_mapping = {"cat": 0, "dog": 1}
+        for fp in files:
+            prefix = fp.stem.split('.')[0].lower()
+            if prefix not in label_mapping:
+                raise ValueError(f"Cannot infer label from filename: {fp.name}")
+            labels.append(label_mapping[prefix])
+        return cls(files, labels, transform)
+
+    def subset(self, indices, transform=None):
+        files = [self.files[i] for i in indices]
+        labels = [self.labels[i] for i in indices]
+        return KaggleDogsDataset(files, labels, transform if transform is not None else self.transform)
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        fp = self.files[idx]
+        img = Image.open(fp).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, self.labels[idx]
+
+    @property
+    def targets(self):
+        return self.labels
 
 # --------------- Model factory ---------------
 def build_model(backbone: str, num_classes: int, pretrained: bool=True, freeze_backbone: bool=False):
@@ -168,26 +218,80 @@ def build_transforms(img_size=224, dataset="dogs"):
         ])
     return train_tf, test_tf
 
+def _stratified_split_indices(labels, val_ratio, seed):
+    labels = np.array(labels)
+    classes = np.unique(labels)
+    rng = np.random.default_rng(seed)
+    train_idx, val_idx = [], []
+    for cls in classes:
+        cls_indices = np.where(labels == cls)[0]
+        rng.shuffle(cls_indices)
+        val_count = max(1, int(round(len(cls_indices) * val_ratio)))
+        val_count = min(val_count, len(cls_indices) - 1) if len(cls_indices) > 1 else val_count
+        val_samples = cls_indices[:val_count]
+        train_samples = cls_indices[val_count:]
+        if len(train_samples) == 0:
+            train_samples = val_samples[:1]
+            val_samples = val_samples[1:]
+        val_idx.extend(val_samples.tolist())
+        train_idx.extend(train_samples.tolist())
+    if len(val_idx) == 0 and len(train_idx) > 1:
+        val_idx.append(train_idx.pop())
+    return train_idx, val_idx
+
+
+def _dataset_targets(dataset):
+    if isinstance(dataset, KaggleDogsDataset):
+        return np.array(dataset.targets)
+    if isinstance(dataset, Subset):
+        base_targets = _dataset_targets(dataset.dataset)
+        return base_targets[dataset.indices]
+    if hasattr(dataset, "targets"):
+        return np.array(dataset.targets)
+    raise AttributeError("Dataset does not expose targets for weighted sampling")
+
+
 def prepare_dataloaders(args):
     img_size = args.img_size
     train_tf, test_tf = build_transforms(img_size, "dogs" if args.dataset=="dogs" else "cifar10")
 
     if args.dataset == "dogs":
-        train_dir = Path(args.data_root) / "train"
-        val_dir   = Path(args.data_root) / "val"
-        test_dir  = Path(args.data_root) / "test"
+        data_root = Path(args.data_root)
+        train_dir = data_root / "train"
+        test_dir_candidates = [data_root / name for name in ("test", "test1", "testset", "testing")]
+        test_dir = next((d for d in test_dir_candidates if d.exists()), None)
 
-        train_set = datasets.ImageFolder(train_dir, transform=train_tf)
-        val_set   = datasets.ImageFolder(val_dir,   transform=test_tf)
-        test_set  = TestFolder(test_dir, transform=test_tf)
+        if not train_dir.exists():
+            raise FileNotFoundError(f"Expected training images under {train_dir}")
+        if test_dir is None:
+            raise FileNotFoundError(f"Could not find test directory under {data_root}. Checked: {[p.name for p in test_dir_candidates]}")
 
-        # Weighted sampler for imbalance (optional)
+        # 如果 train 下存在类别子目录，则仍然使用 ImageFolder
+        has_subdirs = any(p.is_dir() for p in train_dir.iterdir())
+        val_dir = data_root / "val"
+        if has_subdirs:
+            if val_dir.exists() and any(val_dir.iterdir()):
+                train_set = datasets.ImageFolder(train_dir, transform=train_tf)
+                val_set   = datasets.ImageFolder(val_dir,   transform(test_tf))
+            else:
+                base_dataset = datasets.ImageFolder(train_dir)
+                train_idx, val_idx = _stratified_split_indices(base_dataset.targets, args.val_ratio, args.seed)
+                train_set = Subset(datasets.ImageFolder(train_dir, transform=train_tf), train_idx)
+                val_set   = Subset(datasets.ImageFolder(train_dir, transform=test_tf), val_idx)
+        else:
+            full_dataset = KaggleDogsDataset.from_directory(train_dir)
+            train_idx, val_idx = _stratified_split_indices(full_dataset.targets, args.val_ratio, args.seed)
+            train_set = full_dataset.subset(train_idx, transform=train_tf)
+            val_set   = full_dataset.subset(val_idx,   transform=test_tf)
+
+        test_set = TestFolder(test_dir, transform=test_tf)
+
         sampler = None
         if args.use_weighted_sampler:
-            # 统计各类样本数 -> 每样本权重 = 1/class_count
-            counts = np.bincount(train_set.targets)
+            train_targets = _dataset_targets(train_set)
+            counts = np.bincount(train_targets, minlength=train_targets.max()+1)
             class_weights = 1.0 / np.maximum(counts, 1)
-            sample_weights = class_weights[train_set.targets]
+            sample_weights = class_weights[train_targets]
             sampler = WeightedRandomSampler(weights=torch.DoubleTensor(sample_weights),
                                             num_samples=len(sample_weights),
                                             replacement=True)
@@ -248,6 +352,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--val_ratio", type=float, default=0.1,
+                        help="validation split ratio when a dedicated val folder is absent")
     parser.add_argument("--freeze_backbone", action="store_true", help="freeze all but final FC")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_amp", action="store_true")
@@ -258,6 +364,8 @@ def main():
     args = parser.parse_args()
 
     set_seed(args.seed)
+    if not 0 < args.val_ratio < 1:
+        raise ValueError("--val_ratio must be between 0 and 1")
     device = get_device()
     Path("outputs").mkdir(exist_ok=True)
 
